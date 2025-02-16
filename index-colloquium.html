@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+        />
+
+        <title>reveal.js</title>
+
+        <link rel="stylesheet" href="dist/reset.css" />
+        <link rel="stylesheet" href="dist/reveal.css" />
+        <link rel="stylesheet" href="dist/theme/white.css" />
+
+        <!-- Theme used for syntax highlighted code -->
+        <link rel="stylesheet" href="plugin/highlight/monokai.css" />
+    </head>
+    <body>
+        <div class="reveal">
+            <div class="slides">
+                <section data-markdown>
+                    <textarea data-template>
+            ## If Only My Posterior Were Normal: Introducing Fisher HMC
+
+            Adrian Seyboldt
+
+            Notes:
+            I'm Adrian Seyboldt, core dev of PyMC (python lib for bayesian stats)
+            Work with PyMC Labs, consultency.
+
+            Fisher HMC is family of HMC sampling algorithms that uses the Fisher
+            divergence to automatically reparameterize models during tuning.
+
+            It is implemented in the Nutpie sampler for PyMC and Stan models.
+
+            Different families of reparametrizations have different properties.
+            I will show how 3 different choices:
+
+            - Elementwise scaling: This corresponds to diagonal mass matrix
+              adaptation. Fast, but does not converge for many models. This is
+              the default in nutpie.
+            - Low rank modified diagonal: Similar to elementwise scaling, but
+              with a low rank modification. Allows to fit some posterior
+              correlations.
+            - Normalizing flows with coupling layers: This is a more general
+              reparametrization that can fit any posterior. It is slower and
+              requires optimization during tuning, but is very flexible.
+
+            ---
+
+            In Bayesian statistics, we want to sample from the posterior
+            distribution, which is defined by a non-normalized density function
+            $\pi(\theta)$.
+
+            Variants of Hamiltonian Markov Chain Monte Carlo (HMC) are the most
+            popular methods to sample from these distribution
+
+            ---
+
+            ## Difficulties with HMC
+
+            - Not all distributions can be sampled
+            - Choice of parametrization matters
+
+            *Huge* issue in practice!
+
+            Notes:
+
+            In practice, we often have to deal with densities that HMC can not
+            deal with well.
+
+            A lot of time is spent on finding ways to specify the models
+            (parametrizations) such that the posterior is well behaved.
+
+            Often, this also depends on the dataset. So a particular
+            parametrization of a model might work well for one dataset, but not
+            for another.
+
+            ---
+
+            ## Goal of Fisher HMC
+
+            We want to automate the process of finding a good parametrization.
+
+            A more robust HMC, even if it is slower, would be a big win.
+
+            ---
+
+            ## Prior art
+
+            - Mass matrix adaptation: Adapt the mass matrix of the HMC sampler
+              during tuning. This is a form of reparametrization.
+            - Variational inference: Find a good parametrization by minimizing
+              the KL divergence between the posterior and a simpler distribution.
+              Then, in a second step, sample from the transformed distribution.
+            - Riemannian HMC: Somehow come up with a local metric and take that
+              into account during sampling.
+
+            todo refs
+
+            Notes:
+
+            I started trying to improve the mass matrix adaptation.
+            Later, I realized the method could be generalized, more similar to VI.
+            Can also be interpreted as a riemannian hmc.
+
+            ---
+
+            ### What is a Reparametrization?
+
+            Bijective function $F$:
+
+            <p>
+            $$ \begin{align*}
+            F(\eta) &= \theta \\
+            F^{-1}(\theta) &= \eta
+            \end{align*} $$
+            </p>
+
+            We get a new density
+
+            $$\nu(\eta) = (F^*\pi)(\eta) = \pi(F(\eta)) \cdot \lvert \text{det} \nabla F(\eta)\rvert$$
+
+            ---
+
+            ### Examples
+
+            ```
+            pm.HalfNormal("sigma")
+            ```
+
+            Internally we use $$\sigma = F(\text{log\_sigma}) = \exp(\text{log\_sigma})$$
+
+            $\theta = \sigma$ and $\eta = \text{log\_sigma}$
+
+            ---
+
+            Rescaling variables:
+
+            ```python
+            pm.Normal("x", sigma=10000)
+            ```
+
+            into
+
+            ```python
+            x_unscaled = pm.Normal("x_unscaled", sigma=1)
+            pm.Deterministic("x", x_unscaled * 10000)
+            ```
+
+            $$
+            (\sigma, x) = F(\sigma, x_\text{unscaled}) = (\sigma, 10000 x_\text{unscaled})
+            $$
+
+            where $\theta = (\sigma, x)$ and $\eta = (\sigma, x_\text{unscaled})$
+
+            ---
+
+            Centered parametrization:
+
+            ```python
+            sigma = ...
+            pm.Normal("x", sigma=sigma, shape=10)
+            ```
+
+            Noncentered parametrization:
+
+            ```python
+            sigma = ...
+            x_unscaled = pm.Normal("x_unscaled", sigma=1, shape=10)
+            pm.Deterministic("x", sigma * x_unscaled)
+            ```
+
+            We can also move from centered to noncentered with
+
+            $$
+            (\sigma, x) = F(\sigma, x_\text{unscaled}) = (\sigma, \sigma x_\text{unscaled})
+            $$
+
+            where $\theta = (\sigma, x)$ and $\eta = (\sigma, x_\text{unscaled})$
+
+            ---
+
+            ### Note: Computing derivatives of $\nu$
+
+            Given $\nabla \log \pi(\theta)$, we can compute $\nabla \log (F^\*\pi)(\eta) = \nabla \log \nu(\eta)$:
+
+            ```python
+            def grad_of_nu(theta, grad_theta):
+                eta = F(theta)
+                _, pull_grad_fn = jax.vjp(inverse_F_and_logdet, eta)
+                grad_eta = pull_grad_fn((grad_theta, 1.))
+                return grad_eta
+            ```
+
+            ---
+
+            <section data-auto-animate>
+            <h2>
+                HMC
+            </h2>
+
+            Choose $\theta_0$ and $v_0 \sim N(0, 1)$
+
+            Repeat leapfrog steps:
+
+            <p>
+            $$ \begin{align*} v_{n+1} &= v_n + \frac{\epsilon}{2}\nabla \log \pi(\theta_n) \\
+            \theta_{n+1} &= \theta_n + \epsilon v_{n+1} \\
+            v_{n+1} &= v_n + \frac{\epsilon}{2} \nabla\log\nu(\eta_{n+1}) \end{align*} $$
+            </p>
+
+            Accept or reject $\theta_n$.
+            </section>
+
+            ---
+
+            <section data-auto-animate>
+            <h2>
+                Transformed HMC
+            </h2>
+
+            Choose $\eta_0 = {\color{blue}F^{-1}(\theta_0)}$ and $v_0 \sim N(0, 1)$
+
+            Repeat leapfrog steps:
+
+            <p>
+            $$ \begin{align*} v_{n+1} &= v_n + \frac{\epsilon}{2}{\color{blue}\nabla \log \nu(\eta_n)} \\
+            \eta_{n+1} &= \eta_n + \epsilon v_{n+1} \\
+            v_{n+1} &= v_n + \frac{\epsilon}{2} {\color{blue}\nabla\log\nu(\theta_{n+1})} \end{align*} $$
+            </p>
+
+            Accept or reject $\theta = {\color{blue}F(\eta_n)}$.
+            </section>
+
+            ---
+
+            This only uses the log density gradients $\nabla \log\nu$.
+
+            Standard normal posteriors work well, so we want
+
+            $$
+            \nabla\log\nu(\eta) \approx \nabla\log N(\eta\mid 0, I)
+            $$
+
+            Or we want this to be small:
+
+            <p>
+            $$
+            \begin{align*}
+            &\mathbb{E}_{\nu(\eta)}[\lVert \nabla\log\nu(\eta) - \nabla\log N(\eta\mid 0, I)\rVert^2]\\
+            &= \mathbb{E}_{\nu(\eta)}[\lVert \nabla\log\nu(\eta) + \eta \rVert^2]
+            \end{align*}
+            $$
+            </p>
+
+
+            ---
+
+            ### Comparison to VI
+
+            Family of parametrizations: $F_\lambda$
+
+            $p_\lambda(\eta) = (F_\lambda^\*\pi)(\eta),\quad q(\eta) = N(\eta\mid 0, I)$
+
+            Nutpie adaptation:
+
+            $$ \min_\lambda \int \lVert \nabla \log q(\eta) - \nabla \log p_\lambda(\eta) \rVert^2 p_\lambda(\eta) d\eta $$
+
+            Variational inference:
+
+            $$ \min_\lambda \int (\log q(\eta) - \log p_\lambda(\eta)) q(\eta) d\eta $$
+
+            ---
+
+            Compare to VI with Fisher divergence
+
+            Maybe with table?
+
+            - Integral with respect to?
+            - Integral with respect to which distribution.
+            - Choice of norm
+            - How to generate draws for Monte Carlo estimate
+
+            ---
+
+            Possible extension: Sobolev norm?
+
+            ---
+
+            ### Turn into minimization problem
+
+            Find parametrization that minimizes the fisher divergence.
+
+            (in a familiy of parametrizations)
+
+            ---
+
+            ### Properties for gaussian posteriors
+
+            ---
+
+            Chicken and egg:
+
+            We need posterior draws to minimize the expectation and find the parametrization.
+
+            We need a good parametrization to get posterior draws.
+
+            Iterate!
+
+            ---
+
+            Start with some parametrization.
+
+            Run HMC for a while $\rightarrow$ Posterior draws
+
+            Fit better parametrization.
+
+            Run HMC in new parametrization...
+
+            $\Rightarrow$ This is the window adaptation we always do during tuning.
+
+            ---
+
+            ### Mass matrix adaptation (currently implemented in nutpie)
+
+            Set $F_{\sigma, \mu}(\eta) = \text{Affine}(\mu, \sigma) = \eta \odot \sigma + \mu$.
+
+            Nutpie diagonal mass matrix:
+
+            <p>
+            $$
+            \sigma, \mu = \text{argmin}_{\sigma, \mu} \mathbb{E}[\lVert \nabla\log (F_{\sigma, \mu}^*\pi)(\eta) + \eta \rVert]
+            $$
+            </p>
+
+            There is an analytical solution for a finite number of posterior draws!
+
+
+            ---
+
+            Old news, this has been in nutpie since the start.
+
+            (also a slight generalization, the low_rank adaptation...)
+
+            ---
+
+            Make family of reparametrizations bigger: Low rank modifications
+
+            ---
+
+            ### Normalizing flows:
+
+            Other families of functions for $F$. We need:
+
+            - Evaluations of $F$
+            - Evaluations of $F^{-1}$
+            - Logdet of $F$
+            - Autodiff of those
+
+            ---
+
+            Can we generalize the affine function family?
+
+            Problem: The parameters of $\text{Affine}$ are always the same!
+
+            We want to scale parameters depending on other values, but the function needs
+            to stay invertable, with easy to compute logp.
+
+            ---
+
+            ### RealNVP
+
+            <img src="plots/RealNVP.drawio.png" width="60%"/>
+
+            ---
+
+            ### RealNVP
+
+            Fix some parameters $\eta_{0:k}$
+
+            <p>
+            $$
+            F(\eta) = \text{Concat}(\eta_{0:k}, \\ \text{Affine}(\text{NN}_\mu(\eta_{0:k}), \text{NN}_\sigma(\eta_{0:k}))(\eta_{k:n}))
+            $$
+            </p>
+
+            Several layers of those with different subsets of parameters.
+
+            No closed form minimization, we need to minimize with SGD...
+
+            ---
+
+            Some modifications to the standard RealNVP:
+
+            - Instead of affine transformations, we use a series of invertible
+              functions. Those have an explicit inverse and logdet and are more
+              flexible than the affine transformations.
+            - We choose systematically, which parameters to scale and shift
+            - Additional MvScale layers that scales the space in a particular direction
+            - Low rank approximations for the hidden layers in the NNs for higher dimensional problems
+
+            ---
+
+            - Upcoming implementation in nutpie!
+            - SGD is messy (learning rate, batch size, NN architecture, overfitting etc)
+            - Potential for dealing with much wider range of posteriors
+            - Speedups for many badly conditioned models
+            - Extra cost for well behaved models
+            - Possibly way more tuning steps?
+
+            ---
+
+            ## Results from posteriordb
+
+            Comparing sampler performance is hard!
+
+            We compare effective sample size per second.
+
+            todo ref to posteriordb
+
+            Notes:
+            todo title "Nutpie is on average 2x faster"
+
+            ---
+
+            <img src="plots/ecdf.png" alt="Speedup" width="80%"/>
+
+            Notes:
+            todo add "nutpie faster", "stan faster"
+            Look up actual percentages.
+            add ref to samplerlab repo
+
+            ---
+
+            Specialized reparametrizations based on the model.
+
+            Could be much cheaper than black box methods like neural networks?
+
+            ---
+
+            Feedback and benchmarks welcome!
+
+            @aseyboldt on discourse or github.
+
+            <img src="plots/nutpie-qr.png" alt="https://github.com/pymc-devs/nutpie" width="20%"/>
+
+            Questions?
+
+            Notes:
+            I hope I could make you curious. If you want to give it a go and try it, see QR code...
+
+            Feedback and benchmarks welcome.
+
+            Please report bugs
+
+            ---
+
+            ## Some extra sample stats
+
+            - Mass matrix over time -> was the tuning period long enough?
+            - Exact location of divergences -> better for parallel plots
+            - Unconstrained draws and grads -> Easier to find posterior correlations and parametrization problems
+
+          </textarea
+                    >
+                </section>
+            </div>
+        </div>
+
+        <script src="dist/reveal.js"></script>
+        <script src="plugin/notes/notes.js"></script>
+        <script src="plugin/markdown/markdown.js"></script>
+        <script src="plugin/highlight/highlight.js"></script>
+        <script src="plugin/math/math.js"></script>
+        <script>
+            // More info about initialization & config:
+            // - https://revealjs.com/initialization/
+            // - https://revealjs.com/config/
+            Reveal.initialize({
+                hash: true,
+
+                // Learn about plugins: https://revealjs.com/plugins/
+                plugins: [
+                    RevealMarkdown,
+                    RevealHighlight,
+                    RevealNotes,
+                    RevealMath.MathJax3,
+                ],
+            });
+        </script>
+    </body>
+</html>
