@@ -97,8 +97,6 @@
             - Riemannian HMC: Somehow come up with a local metric and take that
               into account during sampling.
 
-            todo refs
-
             Notes:
 
             I started trying to improve the mass matrix adaptation.
@@ -109,7 +107,9 @@
 
             ### What is a Reparametrization?
 
-            Bijective function $F$:
+            Posterior defined on space $X \subset \mathbb{R}^n$.
+
+            Bijective function $F: Y \to X$:
 
             <p>
             $$ \begin{align*}
@@ -120,79 +120,40 @@
 
             We get a new density
 
-            $$\nu(\eta) = (F^*\pi)(\eta) = \pi(F(\eta)) \cdot \lvert \text{det} \nabla F(\eta)\rvert$$
+            $$\nu(\eta) = \pi(F(\eta)) \cdot \lvert \text{det } d F(\eta)\rvert$$
 
             ---
 
             ### Examples
 
-            ```
-            pm.HalfNormal("sigma")
-            ```
+            $$
+            \sigma \sim N^+(0, 1)
+            $$
 
-            Internally we use $$\sigma = F(\text{log\_sigma}) = \exp(\text{log\_sigma})$$
-
-            $\theta = \sigma$ and $\eta = \text{log\_sigma}$
+            So $X = \mathbb{R}^+$ and for instance $F(\eta) = \exp(\eta) = \sigma$.
 
             ---
 
             Rescaling variables:
 
-            ```python
-            pm.Normal("x", sigma=10000)
-            ```
-
-            into
-
-            ```python
-            x_unscaled = pm.Normal("x_unscaled", sigma=1)
-            pm.Deterministic("x", x_unscaled * 10000)
-            ```
-
             $$
-            (\sigma, x) = F(\sigma, x_\text{unscaled}) = (\sigma, 10000 x_\text{unscaled})
+            x \sim N(0, 1000)
             $$
 
-            where $\theta = (\sigma, x)$ and $\eta = (\sigma, x_\text{unscaled})$
+            Reparametrization $F(\eta) = 1000 \eta = x$
 
             ---
 
-            Centered parametrization:
-
-            ```python
-            sigma = ...
-            pm.Normal("x", sigma=sigma, shape=10)
-            ```
-
-            Noncentered parametrization:
-
-            ```python
-            sigma = ...
-            x_unscaled = pm.Normal("x_unscaled", sigma=1, shape=10)
-            pm.Deterministic("x", sigma * x_unscaled)
-            ```
-
-            We can also move from centered to noncentered with
-
+            <div>
             $$
-            (\sigma, x) = F(\sigma, x_\text{unscaled}) = (\sigma, \sigma x_\text{unscaled})
+            \begin{align*}
+            \sigma &\sim N^+(0, 1) \\
+            x &\sim N(0, \sigma^2)
+            \end{align*}
             $$
+            </div>
 
-            where $\theta = (\sigma, x)$ and $\eta = (\sigma, x_\text{unscaled})$
-
-            ---
-
-            ### Note: Computing derivatives of $\nu$
-
-            Given $\nabla \log \pi(\theta)$, we can compute $\nabla \log (F^\*\pi)(\eta) = \nabla \log \nu(\eta)$:
-
-            ```python
-            def grad_of_nu(theta, grad_theta):
-                eta = F(theta)
-                _, pull_grad_fn = jax.vjp(inverse_F_and_logdet, eta)
-                grad_eta = pull_grad_fn((grad_theta, 1.))
-                return grad_eta
-            ```
+            We might want to use $F(\eta_0, \eta_1) = (\exp(\eta_0), \exp(\eta_0) \eta_1) = (\sigma, x)$.
 
             ---
 
@@ -208,7 +169,7 @@
             <p>
             $$ \begin{align*} v_{n+1} &= v_n + \frac{\epsilon}{2}\nabla \log \pi(\theta_n) \\
             \theta_{n+1} &= \theta_n + \epsilon v_{n+1} \\
-            v_{n+1} &= v_n + \frac{\epsilon}{2} \nabla\log\nu(\eta_{n+1}) \end{align*} $$
+            v_{n+1} &= v_n + \frac{\epsilon}{2} \nabla\log\pi(\theta_{n+1}) \end{align*} $$
             </p>
 
             Accept or reject $\theta_n$.
@@ -236,7 +197,8 @@
 
             ---
 
-            This only uses the log density gradients $\nabla \log\nu$.
+            The proposal only depends on the gradient of the log density $\nabla
+            \log\nu$, not the density itself!
 
             Standard normal posteriors work well, so we want
 
@@ -253,8 +215,52 @@
             &= \mathbb{E}_{\nu(\eta)}[\lVert \nabla\log\nu(\eta) + \eta \rVert^2]
             \end{align*}
             $$
+
+            **Fisher divergence** with a natural choice of norm
+
             </p>
 
+            ---
+
+            Family of bijections $F_\lambda$.
+
+            Given posterior draws $\theta_i$ and scores $s_i$ in the original space $X$
+
+            we minimize the Monte Carlo estimate of the fisher divergence to find $\mu$:
+
+            $$
+            \hat{\mu} = \text{argmin}_\mu \sum_i\lVert F^*(s_i) + F^{-1}(\theta_i)\rVert^2
+            $$
+
+            ---
+
+            ### Note: Compute scores on $Y$ based on scores on $X$
+
+            Given $\nabla \log \pi(\theta)$, we can compute $\nabla \log \nu(\eta)$:
+
+            ```python
+            def grad_of_nu(theta, grad_theta):
+                eta = F_inv(theta)
+                _, pull_grad_fn = jax.vjp(F_and_logdet, eta)
+                grad_eta = pull_grad_fn((grad_theta, 1.))
+                return grad_eta
+            ```
+
+            ---
+
+            ## Fisher HMC
+
+            Choose some bijection $F_0$.
+
+            Repeat:
+
+            1. Generate $\theta$ and $s$ using HMC with bijection $F_i$
+            2. Fit $F_{i+1}$ by minimizing Fisher Divergence on $\theta$ and $s$.
+
+            <ul class="fragment">
+                <li>Which family of bijections?</li>
+                <li>How do we minimize?</li>
+            </ul>
 
             ---
 
@@ -264,89 +270,89 @@
 
             $p_\lambda(\eta) = (F_\lambda^\*\pi)(\eta),\quad q(\eta) = N(\eta\mid 0, I)$
 
-            Nutpie adaptation:
+            Loss in Fisher HMC:
 
             $$ \min_\lambda \int \lVert \nabla \log q(\eta) - \nabla \log p_\lambda(\eta) \rVert^2 p_\lambda(\eta) d\eta $$
 
-            Variational inference:
+            Loss in Variational Inference:
 
             $$ \min_\lambda \int (\log q(\eta) - \log p_\lambda(\eta)) q(\eta) d\eta $$
 
             ---
 
-            Compare to VI with Fisher divergence
+            ## Possible extension
 
-            Maybe with table?
+            We are still not using the density!
 
-            - Integral with respect to?
-            - Integral with respect to which distribution.
-            - Choice of norm
-            - How to generate draws for Monte Carlo estimate
+            Possible extensions:
 
-            ---
+            - Minimzie sum of KL divergence and Fisher divergence
+            - Minimize Sobolev norm $\int \lVert \nabla f(x) \rVert^2 + \int f(x)^2$
 
-            Possible extension: Sobolev norm?
+            Using only the Fisher divergence seems to be better?
 
             ---
 
-            ### Turn into minimization problem
+            ## Choices for bijections
 
-            Find parametrization that minimizes the fisher divergence.
-
-            (in a familiy of parametrizations)
-
-            ---
-
-            ### Properties for gaussian posteriors
+            - Coordinate-wise affine functions: Diagonal mass matrix adaptation
+            - Affine functions: Full mass matrix adaptation
+            - Affine functions with few non-unit eigenvalues: Low rank modified mass matrix adaptation
+            - Normalizing flows
+            - Model-informed families
 
             ---
 
-            Chicken and egg:
+            ### Coordinate-wise affine
 
-            We need posterior draws to minimize the expectation and find the parametrization.
+            $$ F(x) = \sigma \odot x + \mu $$
 
-            We need a good parametrization to get posterior draws.
-
-            Iterate!
-
-            ---
-
-            Start with some parametrization.
-
-            Run HMC for a while $\rightarrow$ Posterior draws
-
-            Fit better parametrization.
-
-            Run HMC in new parametrization...
-
-            $\Rightarrow$ This is the window adaptation we always do during tuning.
-
-            ---
-
-            ### Mass matrix adaptation (currently implemented in nutpie)
-
-            Set $F_{\sigma, \mu}(\eta) = \text{Affine}(\mu, \sigma) = \eta \odot \sigma + \mu$.
-
-            Nutpie diagonal mass matrix:
+            Closed form solution for the optimization problem!
 
             <p>
             $$
-            \sigma, \mu = \text{argmin}_{\sigma, \mu} \mathbb{E}[\lVert \nabla\log (F_{\sigma, \mu}^*\pi)(\eta) + \eta \rVert]
+            \sigma = \sqrt{\frac{\text{Std}(\theta_i)}{\text{Std}(s_i)}} \quad
+            \mu = \text{Mean}(\theta_i) + \sigma^2 \odot \text{Mean}(s_i)
             $$
             </p>
 
-            There is an analytical solution for a finite number of posterior draws!
+            Minimizes $\sum (\lambda_i + \lambda_i^{-1})$.
 
-
-            ---
-
-            Old news, this has been in nutpie since the start.
-
-            (also a slight generalization, the low_rank adaptation...)
+            Mass matrix $M = \text{diag}(s)^{-2}$.
 
             ---
 
-            Make family of reparametrizations bigger: Low rank modifications
+            ### Affine bijections
+
+            $$
+            F(x) = Ax + \mu
+            $$
+
+            Closed form solution for optimization problem:
+
+            <p>
+            $$
+            \begin{gather*}
+            AA^T \text{Cov}(s) AA^T = \text{Cov}(\theta) \\
+            \mu = \text{Mean}(\theta) + AA^T \text{Mean}(s_i)
+            \end{gather*}
+            $$
+            </p>
+
+
+            Mass matrix $M^{-1} = AA^T$.
+
+            ---
+
+            ## Low-rank modifications
+
+            $F(x) = D(U(\Lambda - I)U^T + I)x$
+
+            Greedy closed form minimum. First find $D$, then $U$ and $\Lambda$.
+
+            Allows fitting some eigenvalues in high dimensional spaces without quadratic cost.
+
+            Somehow doesn't work all that well?
 
             ---
 
@@ -388,55 +394,55 @@
 
             Several layers of those with different subsets of parameters.
 
-            No closed form minimization, we need to minimize with SGD...
+            No closed form minimization, we need to minimize with adam or similar
 
             ---
 
-            Some modifications to the standard RealNVP:
+            ### Some modifications to RealNVP:
 
-            - Instead of affine transformations, we use a series of invertible
-              functions. Those have an explicit inverse and logdet and are more
-              flexible than the affine transformations.
-            - We choose systematically, which parameters to scale and shift
+            - Parameterize scaling variables as $\exp(\sinh(x))$.
+            - Replace affine transformations with non-linear function.
+            - We choose systematically, which parameters to keep constant.
             - Additional MvScale layers that scales the space in a particular direction
             - Low rank approximations for the hidden layers in the NNs for higher dimensional problems
 
             ---
 
-            - Upcoming implementation in nutpie!
-            - SGD is messy (learning rate, batch size, NN architecture, overfitting etc)
-            - Potential for dealing with much wider range of posteriors
+            - Can deal with a much wider range of posteriors!
             - Speedups for many badly conditioned models
             - Extra cost for well behaved models
-            - Possibly way more tuning steps?
+
+            ---
+
+            ### Future?
+
+            Specialized reparametrizations based on the model.
+
+            Could be much cheaper than black box methods like neural networks?
+
+            ---
+
+            ### Implementation status
+
+            - Diagonal: Used in nutpie, might become default in PyMC and Stan?
+            - Low rank: Implemented in nutpie
+            - Normalizing flows: nutpie PR, getting merged soon
 
             ---
 
             ## Results from posteriordb
 
-            Comparing sampler performance is hard!
-
-            We compare effective sample size per second.
-
-            todo ref to posteriordb
-
-            Notes:
-            todo title "Nutpie is on average 2x faster"
-
             ---
+
+            ### Diagonal
 
             <img src="plots/ecdf.png" alt="Speedup" width="80%"/>
 
-            Notes:
-            todo add "nutpie faster", "stan faster"
-            Look up actual percentages.
-            add ref to samplerlab repo
-
             ---
 
-            Specialized reparametrizations based on the model.
+            ## Normalizing Flow
 
-            Could be much cheaper than black box methods like neural networks?
+            <img src="plots/nutpie-nf-ess.png" width="60%"/>
 
             ---
 
@@ -455,14 +461,6 @@
 
             Please report bugs
 
-            ---
-
-            ## Some extra sample stats
-
-            - Mass matrix over time -> was the tuning period long enough?
-            - Exact location of divergences -> better for parallel plots
-            - Unconstrained draws and grads -> Easier to find posterior correlations and parametrization problems
-
           </textarea
                     >
                 </section>
@@ -480,6 +478,9 @@
             // - https://revealjs.com/config/
             Reveal.initialize({
                 hash: true,
+                slideNumber: true,
+                controls: true,
+                transition: "fade",
 
                 // Learn about plugins: https://revealjs.com/plugins/
                 plugins: [
